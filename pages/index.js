@@ -264,9 +264,9 @@ export default function Home() {
         )}
       </div>
 
-      <h1 className="text-3xl font-extrabold text-gray-800 mb-6 leading-snug">
-        Welcome <br /> to <br /> MDCI
-      </h1>
+      <h2 className="text-2xl font-bold text-gray-800 mb-6 leading-snug">
+        Welcome <br /> to <br /> DESINERZ ACADEMY
+      </h2>
 
       <button
         onClick={handleAttendance}
