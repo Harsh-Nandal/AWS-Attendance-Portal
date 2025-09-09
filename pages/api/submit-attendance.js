@@ -3,6 +3,14 @@ import connectDB from "../../lib/mongodb";
 import Attendance from "../../models/Attendance";
 import User from "../../models/User";
 import dayjs from "dayjs";
+import utc from "dayjs/plugin/utc";
+import timezone from "dayjs/plugin/timezone";
+
+dayjs.extend(utc);
+dayjs.extend(timezone);
+
+// Force timezone to India (IST)
+const APP_TZ = "Asia/Kolkata";
 
 export default async function handler(req, res) {
   if (req.method !== "POST") {
@@ -14,7 +22,9 @@ export default async function handler(req, res) {
     if (!body || typeof body === "string") {
       try {
         body = JSON.parse(body);
-      } catch {}
+      } catch (e) {
+        // leave as-is if parse fails
+      }
     }
 
     const { userId } = body || {};
@@ -30,19 +40,28 @@ export default async function handler(req, res) {
       return res.status(404).json({ message: "User not found" });
     }
 
-    const today = dayjs().format("YYYY-MM-DD");
-    let record = await Attendance.findOne({ userId: String(userId), date: today });
+    // Get today's date in IST
+    const today = dayjs().tz(APP_TZ).format("YYYY-MM-DD");
+
+    let record = await Attendance.findOne({
+      userId: String(userId),
+      date: today,
+    });
+
+    // Current time in IST
+    const nowIst = dayjs().tz(APP_TZ);
+    const timeString = nowIst.format("HH:mm:ss"); // Punch in/out time
+    const recordedAtDate = nowIst.toDate(); // Save Date object in IST
 
     if (!record) {
       // Punch in
-      const punchInTime = dayjs().format("HH:mm:ss");
       record = new Attendance({
         userId: String(userId),
         name: user.name || "",
         role: user.role || "",
         date: today,
-        punchIn: punchInTime,
-        recordedAt: new Date(),
+        punchIn: timeString,
+        recordedAt: recordedAtDate,
       });
       await record.save();
 
@@ -57,8 +76,8 @@ export default async function handler(req, res) {
 
     if (record && record.punchIn && !record.punchOut) {
       // Punch out
-      record.punchOut = dayjs().format("HH:mm:ss");
-      record.recordedAt = new Date();
+      record.punchOut = timeString;
+      record.recordedAt = recordedAtDate;
       await record.save();
 
       return res.status(200).json({
