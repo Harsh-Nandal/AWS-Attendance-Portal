@@ -1,0 +1,17 @@
+@import "tailwindcss";
+
+@keyframes borderPulse {
+  0%,
+  100% {
+    transform: scale(0.2);
+    opacity: 0.4;
+  }
+  50% {
+    transform: scale(1.2);
+    opacity: 1;
+  }
+}
+
+.animate-border-pulse {
+  animation: borderPulse 2s ease-in-out infinite;
+}

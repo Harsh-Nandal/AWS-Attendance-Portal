@@ -1,0 +1,82 @@
+/* Full-height centered container */
+.container {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center; /* ✅ Center horizontally */
+  /* padding: 2rem 1rem; */
+  background: #f8f9fa;
+  font-family: "Segoe UI", sans-serif;
+}
+
+/* Heading */
+.heading {
+  text-align: center;
+  /* margin: 0 0 1rem 0; */
+  color: #2563eb;
+}
+
+/* Form wrapper */
+.form {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  width: 100%;
+  max-width: 400px; /* ✅ Keeps form centered */
+}
+
+/* Inputs and Select */
+.inputField {
+  padding: 0.75rem;
+  border: 1px solid #ddd;
+  border-radius: 8px;
+  font-size: 1rem;
+  width: 100%;
+  box-sizing: border-box; /* ✅ Prevent overflow */
+}
+
+/* Camera section */
+.camera {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+/* Capture button */
+.camera button {
+  margin-top: 0.5rem;
+  background-color: #3b82f6;
+  color: white;
+  padding: 0.6rem 1rem;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+/* Previewed Image */
+.preview {
+  display: block;
+  margin: 1rem auto 0;
+  width: 100%;
+  max-width: 300px;
+  border-radius: 8px;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.15);
+}
+
+/* Submit Button */
+.submitBtn {
+  background-color: #16a34a;
+  color: white;
+  padding: 0.8rem;
+  border: none;
+  border-radius: 8px;
+  font-size: 1rem;
+  cursor: pointer;
+  transition: background-color 0.3s ease;
+}
+
+.submitBtn:hover {
+  background-color: #15803d;
+}
