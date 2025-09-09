@@ -3,21 +3,13 @@ import connectDB from '../../lib/mongodb';
 import Attendance from '../../models/Attendance';
 import User from '../../models/User';
 import dayjs from 'dayjs';
+import utc from 'dayjs/plugin/utc';
+import timezone from 'dayjs/plugin/timezone';
 
-/**
- * POST body: { userId: "..." }
- *
- * Behavior:
- * - If no attendance record for today -> create with punchIn = now
- * - If record exists and has punchIn but no punchOut:
- *    - If time since punchIn < MIN_INTERVAL_SECONDS -> treat as duplicate (do not set punchOut)
- *    - Else set punchOut = now (atomic attempt, handles race)
- * - If record exists and has both punchIn and punchOut -> return Already Punched Out
- *
- * Config:
- * - MIN_PUNCH_INTERVAL_SECONDS (env) default 60
- */
+dayjs.extend(utc);
+dayjs.extend(timezone);
 
+const APP_TZ = 'Asia/Kolkata';
 const MIN_INTERVAL = Number(process.env.MIN_PUNCH_INTERVAL_SECONDS) || 60;
 
 export default async function handler(req, res) {
@@ -28,51 +20,66 @@ export default async function handler(req, res) {
   try {
     await connectDB();
 
-    const { userId } = req.body || {};
+    // Parse body safely
+    let body = req.body;
+    if (!body || typeof body === 'string') {
+      try {
+        body = JSON.parse(body || '{}');
+      } catch (e) {
+        body = {};
+      }
+    }
+
+    const { userId } = body || {};
     if (!userId || typeof userId !== 'string') {
       return res.status(400).json({ message: 'Missing or invalid userId' });
     }
 
-    // verify user exists (optional but helpful)
+    // verify user exists
     const user = await User.findOne({ userId: String(userId) }).lean();
     if (!user) {
       return res.status(404).json({ message: 'User not found' });
     }
 
-    const today = dayjs().format('YYYY-MM-DD');
-    const now = dayjs();
-    const nowStr = now.format('HH:mm:ss');
+    // IST-aware now and today's date
+    const nowIst = dayjs().tz(APP_TZ);
+    const today = nowIst.format('YYYY-MM-DD');
+    const nowStr = nowIst.format('HH:mm:ss');
+    const recordedAtDate = nowIst.toDate();
+    const recordedAtIso = nowIst.format(); // optional, human-readable ISO with offset
 
     // Load today's record
     let record = await Attendance.findOne({ userId: String(userId), date: today });
 
     // Case 1: no record -> create punchIn
     if (!record) {
-      const punchInStr = nowStr;
       const newRecord = new Attendance({
         userId: String(userId),
         name: user.name || '',
         role: user.role || '',
         date: today,
-        punchIn: punchInStr,
+        punchIn: nowStr,
+        recordedAt: recordedAtDate,
+        recordedAtIso,
       });
       await newRecord.save();
 
       return res.status(200).json({
         message: 'Punched In Successfully',
         status: 'Punched In',
-        punchIn: punchInStr,
+        punchIn: newRecord.punchIn,
+        recordedAt: newRecord.recordedAt,
+        recordedAtIso: newRecord.recordedAtIso,
       });
     }
 
     // Case 2: record exists and only punchIn exists (no punchOut yet)
     if (record && record.punchIn && !record.punchOut) {
-      // compute seconds diff between now and punchIn
-      // record.punchIn stored as 'HH:mm:ss' so combine with today's date
-      const punchInMoment = dayjs(`${record.date} ${record.punchIn}`, 'YYYY-MM-DD HH:mm:ss');
-      const diffSec = now.diff(punchInMoment, 'second');
+      // compute seconds diff between now and stored punchIn (assume punchIn is in HH:mm:ss for that date)
+      const punchInMoment = dayjs.tz(`${record.date} ${record.punchIn}`, 'YYYY-MM-DD HH:mm:ss', APP_TZ);
+      const diffSec = nowIst.diff(punchInMoment, 'second');
 
-      // If too soon, treat as duplicate/ignored (prevents immediate punch-out)
+      // If too soon, treat as duplicate/ignored
       if (diffSec < MIN_INTERVAL) {
         return res.status(200).json({
           message: `Duplicate/too-fast: already punched in ${diffSec}s ago. Minimum interval ${MIN_INTERVAL}s.`,
@@ -82,12 +89,12 @@ export default async function handler(req, res) {
         });
       }
 
-      // Attempt atomic update: set punchOut only if punchOut is still not set
+      // Atomic update: set punchOut only if it's still absent or null
       const updated = await Attendance.findOneAndUpdate(
-        { _id: record._id, punchOut: { $exists: false } },
-        { $set: { punchOut: nowStr } },
+        { _id: record._id, $or: [{ punchOut: { $exists: false } }, { punchOut: null }] },
+        { $set: { punchOut: nowStr, recordedAt: recordedAtDate, recordedAtIso } },
         { new: true }
-      );
+      ).lean();
 
       if (updated && updated.punchOut) {
         return res.status(200).json({
@@ -95,10 +102,12 @@ export default async function handler(req, res) {
           status: 'Punched Out',
           punchIn: updated.punchIn,
           punchOut: updated.punchOut,
+          recordedAt: updated.recordedAt,
+          recordedAtIso: updated.recordedAtIso,
         });
       }
 
-      // If update didn't apply (race), re-fetch and return current state
+      // If update didn't apply due to race, re-fetch and return current state
       const latest = await Attendance.findById(record._id).lean();
       if (latest && latest.punchOut) {
         return res.status(200).json({
@@ -106,6 +115,8 @@ export default async function handler(req, res) {
           status: 'Punched Out',
           punchIn: latest.punchIn,
           punchOut: latest.punchOut,
+          recordedAt: latest.recordedAt,
+          recordedAtIso: latest.recordedAtIso,
         });
       }
 
@@ -120,6 +131,8 @@ export default async function handler(req, res) {
         status: 'Punched Out',
         punchIn: record.punchIn,
         punchOut: record.punchOut,
+        recordedAt: record.recordedAt,
+        recordedAtIso: record.recordedAtIso,
       });
     }
 
