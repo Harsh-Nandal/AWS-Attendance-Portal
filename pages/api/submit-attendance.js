@@ -9,7 +9,7 @@ import timezone from 'dayjs/plugin/timezone';
 dayjs.extend(utc);
 dayjs.extend(timezone);
 
-const APP_TZ = 'Asia/Kolkata';
+const APP_TZ = process.env.APP_TIMEZONE || 'Asia/Kolkata';
 const MIN_INTERVAL = Number(process.env.MIN_PUNCH_INTERVAL_SECONDS) || 60;
 
 export default async function handler(req, res) {
@@ -44,9 +44,11 @@ export default async function handler(req, res) {
     // IST-aware now and today's date
     const nowIst = dayjs().tz(APP_TZ);
     const today = nowIst.format('YYYY-MM-DD');
-    const nowStr = nowIst.format('HH:mm:ss');
-    const recordedAtDate = nowIst.toDate();
-    const recordedAtIso = nowIst.format(); // optional, human-readable ISO with offset
+
+    // IMPORTANT: generate the canonical punch timestamp here once and reuse it
+    const nowStr = nowIst.format('HH:mm:ss'); // stored human time
+    const recordedAtDate = nowIst.toDate(); // actual Date saved in DB
+    const recordedAtIso = nowIst.toISOString(); // canonical ISO (UTC) for debugging
 
     // Load today's record
     let record = await Attendance.findOne({ userId: String(userId), date: today });
@@ -59,6 +61,7 @@ export default async function handler(req, res) {
         role: user.role || '',
         date: today,
         punchIn: nowStr,
+        // Keep a precise machine timestamp too (useful later)
         recordedAt: recordedAtDate,
         recordedAtIso,
       });
@@ -75,7 +78,7 @@ export default async function handler(req, res) {
 
     // Case 2: record exists and only punchIn exists (no punchOut yet)
     if (record && record.punchIn && !record.punchOut) {
-      // compute seconds diff between now and stored punchIn (assume punchIn is in HH:mm:ss for that date)
+      // compute seconds diff between now and stored punchIn (assume punchIn is 'HH:mm:ss' for record.date)
       const punchInMoment = dayjs.tz(`${record.date} ${record.punchIn}`, 'YYYY-MM-DD HH:mm:ss', APP_TZ);
       const diffSec = nowIst.diff(punchInMoment, 'second');
 
@@ -89,14 +92,21 @@ export default async function handler(req, res) {
         });
       }
 
-      // Atomic update: set punchOut only if it's still absent or null
-      const updated = await Attendance.findOneAndUpdate(
-        { _id: record._id, $or: [{ punchOut: { $exists: false } }, { punchOut: null }] },
-        { $set: { punchOut: nowStr, recordedAt: recordedAtDate, recordedAtIso } },
-        { new: true }
-      ).lean();
+      // Atomic update: set punchOut only if it's still absent/null
+      // Use the canonical nowStr we computed above so what we write is identical to what we return
+      const filter = { _id: record._id, $or: [{ punchOut: { $exists: false } }, { punchOut: null }] };
+      const update = {
+        $set: {
+          punchOut: nowStr,
+          recordedAt: recordedAtDate,
+          recordedAtIso,
+        },
+      };
+
+      const updated = await Attendance.findOneAndUpdate(filter, update, { new: true }).exec();
 
       if (updated && updated.punchOut) {
+        // Return the exact timestamp we wrote (nowStr)
         return res.status(200).json({
           message: 'Punched Out Successfully',
           status: 'Punched Out',
