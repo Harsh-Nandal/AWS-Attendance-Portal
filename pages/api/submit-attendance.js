@@ -12,6 +12,11 @@ dayjs.extend(timezone);
 const APP_TZ = process.env.APP_TIMEZONE || 'Asia/Kolkata';
 const MIN_INTERVAL = Number(process.env.MIN_PUNCH_INTERVAL_SECONDS) || 60;
 
+function isoWithOffset(d) {
+  // returns YYYY-MM-DDTHH:mm:ss+05:30 style string (with the configured timezone offset)
+  return d.format('YYYY-MM-DDTHH:mm:ssZ');
+}
+
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
     return res.status(405).json({ message: 'Method Not Allowed' });
@@ -41,14 +46,15 @@ export default async function handler(req, res) {
       return res.status(404).json({ message: 'User not found' });
     }
 
-    // IST-aware now and today's date
-    const nowIst = dayjs().tz(APP_TZ);
-    const today = nowIst.format('YYYY-MM-DD');
+    // canonical now in configured timezone
+    const nowTz = dayjs().tz(APP_TZ);
+    const today = nowTz.format('YYYY-MM-DD');
 
-    // IMPORTANT: generate the canonical punch timestamp here once and reuse it
-    const nowStr = nowIst.format('HH:mm:ss'); // stored human time
-    const recordedAtDate = nowIst.toDate(); // actual Date saved in DB
-    const recordedAtIso = nowIst.toISOString(); // canonical ISO (UTC) for debugging
+    // canonical local strings (human readable) and ISO-with-offset strings
+    const nowLocalHH = nowTz.format('HH:mm:ss'); // e.g. "14:53:12"
+    const nowIsoLocal = isoWithOffset(nowTz); // e.g. "2025-09-08T14:53:12+05:30"
+    const recordedAtDate = nowTz.toDate(); // Date object (UTC under the hood)
+    const recordedAtIsoUtc = nowTz.toISOString(); // canonical ISO (UTC), useful for audits
 
     // Load today's record
     let record = await Attendance.findOne({ userId: String(userId), date: today });
@@ -60,10 +66,13 @@ export default async function handler(req, res) {
         name: user.name || '',
         role: user.role || '',
         date: today,
-        punchIn: nowStr,
-        // Keep a precise machine timestamp too (useful later)
+        // human-friendly local time
+        punchIn: nowLocalHH,
+        // ISO with timezone offset
+        punchInIso: nowIsoLocal,
+        // machine timestamp
         recordedAt: recordedAtDate,
-        recordedAtIso,
+        recordedAtIso: recordedAtIsoUtc,
       });
       await newRecord.save();
 
@@ -71,6 +80,7 @@ export default async function handler(req, res) {
         message: 'Punched In Successfully',
         status: 'Punched In',
         punchIn: newRecord.punchIn,
+        punchInIso: newRecord.punchInIso,
         recordedAt: newRecord.recordedAt,
         recordedAtIso: newRecord.recordedAtIso,
       });
@@ -78,9 +88,9 @@ export default async function handler(req, res) {
 
     // Case 2: record exists and only punchIn exists (no punchOut yet)
     if (record && record.punchIn && !record.punchOut) {
-      // compute seconds diff between now and stored punchIn (assume punchIn is 'HH:mm:ss' for record.date)
+      // compute seconds difference between now and stored punchIn (both in APP_TZ)
       const punchInMoment = dayjs.tz(`${record.date} ${record.punchIn}`, 'YYYY-MM-DD HH:mm:ss', APP_TZ);
-      const diffSec = nowIst.diff(punchInMoment, 'second');
+      const diffSec = nowTz.diff(punchInMoment, 'second');
 
       // If too soon, treat as duplicate/ignored
       if (diffSec < MIN_INTERVAL) {
@@ -88,30 +98,32 @@ export default async function handler(req, res) {
           message: `Duplicate/too-fast: already punched in ${diffSec}s ago. Minimum interval ${MIN_INTERVAL}s.`,
           status: 'Already Punched In (recent)',
           punchIn: record.punchIn,
+          punchInIso: record.punchInIso || null,
           secondsSincePunchIn: diffSec,
         });
       }
 
       // Atomic update: set punchOut only if it's still absent/null
-      // Use the canonical nowStr we computed above so what we write is identical to what we return
       const filter = { _id: record._id, $or: [{ punchOut: { $exists: false } }, { punchOut: null }] };
       const update = {
         $set: {
-          punchOut: nowStr,
+          punchOut: nowLocalHH,
+          punchOutIso: nowIsoLocal,
           recordedAt: recordedAtDate,
-          recordedAtIso,
+          recordedAtIso: recordedAtIsoUtc,
         },
       };
 
       const updated = await Attendance.findOneAndUpdate(filter, update, { new: true }).exec();
 
       if (updated && updated.punchOut) {
-        // Return the exact timestamp we wrote (nowStr)
         return res.status(200).json({
           message: 'Punched Out Successfully',
           status: 'Punched Out',
           punchIn: updated.punchIn,
+          punchInIso: updated.punchInIso || null,
           punchOut: updated.punchOut,
+          punchOutIso: updated.punchOutIso || null,
           recordedAt: updated.recordedAt,
           recordedAtIso: updated.recordedAtIso,
         });
@@ -124,7 +136,9 @@ export default async function handler(req, res) {
           message: 'Punched Out (by another request)',
           status: 'Punched Out',
           punchIn: latest.punchIn,
+          punchInIso: latest.punchInIso || null,
           punchOut: latest.punchOut,
+          punchOutIso: latest.punchOutIso || null,
           recordedAt: latest.recordedAt,
           recordedAtIso: latest.recordedAtIso,
         });
@@ -140,7 +154,9 @@ export default async function handler(req, res) {
         message: 'Already Punched Out',
         status: 'Punched Out',
         punchIn: record.punchIn,
+        punchInIso: record.punchInIso || null,
         punchOut: record.punchOut,
+        punchOutIso: record.punchOutIso || null,
         recordedAt: record.recordedAt,
         recordedAtIso: record.recordedAtIso,
       });
