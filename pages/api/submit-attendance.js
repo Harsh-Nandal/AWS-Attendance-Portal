@@ -45,43 +45,65 @@ export default async function handler(req, res) {
     const nowIst = dayjs().tz(APP_TZ);
     const today = nowIst.format('YYYY-MM-DD');         // date in IST
     const nowTime = nowIst.format('HH:mm:ss');         // human-friendly IST time
-    const recordedAtIso = nowIst.format();             // ISO with offset e.g. 2025-09-09T15:00:00+05:30
     const recordedAtDate = nowIst.toDate();            // JS Date (instant)
 
-    // Load today's record
-    let record = await Attendance.findOne({ userId: String(userId), date: today });
-
-    // Case 1: no record -> create punchIn
-    if (!record) {
-      const newRecord = new Attendance({
+    // --- Atomic upsert to create punchIn only if no record exists for (userId, date) ---
+    // Use native collection.findOneAndUpdate so we can inspect lastErrorObject.upserted
+    const filter = { userId: String(userId), date: today };
+    const update = {
+      $setOnInsert: {
         userId: String(userId),
         name: user.name || '',
         role: user.role || '',
         date: today,
         punchIn: nowTime,
-        punchInIso: recordedAtIso,
         recordedAt: recordedAtDate,
-        recordedAtIso: recordedAtIso,
-      });
-      await newRecord.save();
+      },
+    };
+    const opts = { upsert: true, returnDocument: 'after' }; // return the document after update/insert
 
+    const rawResult = await Attendance.collection.findOneAndUpdate(filter, update, opts);
+    // rawResult has { value, lastErrorObject, ok } from the native driver
+    const { value: docAfterUpsert, lastErrorObject } = rawResult || {};
+
+    // If lastErrorObject.upserted exists -> we created a new document => Punch In
+    if (lastErrorObject && lastErrorObject.upserted) {
+      // docAfterUpsert contains the newly created document
       return res.status(200).json({
         message: 'Punched In Successfully',
         status: 'Punched In',
-        punchIn: newRecord.punchIn,
-        punchInIso: newRecord.punchInIso,
-        recordedAtIso: newRecord.recordedAtIso,
+        punchIn: docAfterUpsert.punchIn,
+        recordedAt: docAfterUpsert.recordedAt,
       });
     }
 
-    // Case 2: record exists and only punchIn exists (no punchOut yet)
-    if (record && record.punchIn && !record.punchOut) {
+    // Otherwise, a document already existed for today. docAfterUpsert is the existing doc.
+    const record = docAfterUpsert;
+
+    if (!record) {
+      // Very unlikely, but handle defensively
+      return res.status(500).json({ message: 'Attendance record not available' });
+    }
+
+    // If already has both punchIn & punchOut
+    if (record.punchIn && record.punchOut) {
+      return res.status(200).json({
+        message: 'Already Punched Out',
+        status: 'Punched Out',
+        punchIn: record.punchIn,
+        punchOut: record.punchOut,
+        recordedAt: record.recordedAt,
+      });
+    }
+
+    // If record has punchIn but no punchOut -> attempt punchOut
+    if (record.punchIn && !record.punchOut) {
       // compute seconds diff between now and stored punchIn (assume punchIn is HH:mm:ss for that date in IST)
       const punchInMoment = dayjs.tz(`${record.date} ${record.punchIn}`, 'YYYY-MM-DD HH:mm:ss', APP_TZ);
       const diffSec = nowIst.diff(punchInMoment, 'second');
 
-      // If too soon, treat as duplicate/ignored
       if (diffSec < MIN_INTERVAL) {
+        // Too soon -> ignore as duplicate
         return res.status(200).json({
           message: `Duplicate/too-fast: already punched in ${diffSec}s ago. Minimum interval ${MIN_INTERVAL}s.`,
           status: 'Already Punched In (recent)',
@@ -90,26 +112,29 @@ export default async function handler(req, res) {
         });
       }
 
-      // Prepare punchOut values
-      const punchOutTime = nowTime;
-      const punchOutIso = recordedAtIso;
-
       // Atomic update: set punchOut only if it's still absent or null
-      const updated = await Attendance.findOneAndUpdate(
-        { _id: record._id, $or: [{ punchOut: { $exists: false } }, { punchOut: null }] },
-        { $set: { punchOut: punchOutTime, punchOutIso, recordedAt: recordedAtDate, recordedAtIso } },
-        { new: true }
-      ).lean();
+      const punchOutUpdate = {
+        $set: {
+          punchOut: nowTime,
+          recordedAt: recordedAtDate,
+        },
+      };
 
-      if (updated && updated.punchOut) {
+      const updatedRaw = await Attendance.collection.findOneAndUpdate(
+        { _id: record._id, $or: [{ punchOut: { $exists: false } }, { punchOut: null }] },
+        punchOutUpdate,
+        { returnDocument: 'after' }
+      );
+
+      const updatedDoc = updatedRaw.value;
+
+      if (updatedDoc && updatedDoc.punchOut) {
         return res.status(200).json({
           message: 'Punched Out Successfully',
           status: 'Punched Out',
-          punchIn: updated.punchIn,
-          punchInIso: updated.punchInIso,
-          punchOut: updated.punchOut,
-          punchOutIso: updated.punchOutIso,
-          recordedAtIso: updated.recordedAtIso,
+          punchIn: updatedDoc.punchIn,
+          punchOut: updatedDoc.punchOut,
+          recordedAt: updatedDoc.recordedAt,
         });
       }
 
@@ -120,32 +145,17 @@ export default async function handler(req, res) {
           message: 'Punched Out (by another request)',
           status: 'Punched Out',
           punchIn: latest.punchIn,
-          punchInIso: latest.punchInIso,
           punchOut: latest.punchOut,
-          punchOutIso: latest.punchOutIso,
-          recordedAtIso: latest.recordedAtIso,
+          recordedAt: latest.recordedAt,
         });
       }
 
-      // unexpected fallback
+      // fallback
       return res.status(500).json({ message: 'Could not set punchOut - try again' });
     }
 
-    // Case 3: already punched out
-    if (record && record.punchIn && record.punchOut) {
-      return res.status(200).json({
-        message: 'Already Punched Out',
-        status: 'Punched Out',
-        punchIn: record.punchIn,
-        punchInIso: record.punchInIso,
-        punchOut: record.punchOut,
-        punchOutIso: record.punchOutIso,
-        recordedAtIso: record.recordedAtIso,
-      });
-    }
-
-    // Fallback
-    return res.status(400).json({ message: 'Invalid attendance state' });
+    // Any other unexpected state -> return it
+    return res.status(400).json({ message: 'Invalid attendance state', record });
   } catch (err) {
     console.error('[Submit Attendance API Error]', err);
     return res.status(500).json({ message: 'Internal Server Error', error: err.message });
