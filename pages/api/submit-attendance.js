@@ -1,182 +1,309 @@
-// pages/api/submit-attendance.js
-import connectDB from '../../lib/mongodb';
-import Attendance from '../../models/Attendance';
-import User from '../../models/User';
-import dayjs from 'dayjs';
-import utc from 'dayjs/plugin/utc';
-import timezone from 'dayjs/plugin/timezone';
+import connectDB from "../../lib/mongodb";
+import Attendance from "../../models/Attendance";
+import User from "../../models/User";
+import moment from "moment-timezone";
 
-dayjs.extend(utc);
-dayjs.extend(timezone);
-
-const APP_TZ = 'Asia/Kolkata';
-const MIN_INTERVAL = Number(process.env.MIN_PUNCH_INTERVAL_SECONDS) || 60;
-
-function isoWithOffset(d) {
-  return d.format('YYYY-MM-DDTHH:mm:ssZ');
-}
+const APP_TZ = "Asia/Kolkata";
+const MIN_REPEAT_SECONDS =
+  process.env.MIN_REPEAT_SECONDS !== undefined && process.env.MIN_REPEAT_SECONDS !== ""
+    ? Number(process.env.MIN_REPEAT_SECONDS)
+    : 60;
 
 export default async function handler(req, res) {
-  if (req.method !== 'POST') {
-    return res.status(405).json({ message: 'Method Not Allowed' });
+  if (req.method !== "POST") {
+    return res.status(405).json({ message: "Method Not Allowed" });
   }
 
   try {
     await connectDB();
 
-    // Safe body parse
-    let body = req.body;
-    if (!body || typeof body === 'string') {
-      try {
-        body = JSON.parse(body || '{}');
-      } catch (e) {
-        body = {};
-      }
+    const { userId, name: reqName, role: reqRole, imageData } = req.body || {};
+    if (!userId) return res.status(400).json({ message: "Missing userId" });
+
+    const uidStr = String(userId);
+    const user = await User.findOne({ userId: uidStr }).lean().catch(() => null);
+
+    const resolvedName = typeof reqName === "string" && reqName.trim() ? reqName.trim() : user?.name ?? "";
+    const resolvedRole = typeof reqRole === "string" && reqRole.trim() ? reqRole.trim() : user?.role ?? "";
+
+    // compute today's date once (server timezone = APP_TZ)
+    const nowForDate = moment().tz(APP_TZ);
+    const today = nowForDate.format("YYYY-MM-DD");
+
+    // fetch record for today
+    let record = await Attendance.findOne({ userId: uidStr, date: today });
+
+    // helper to build iso + 12-hour display
+    function makeTimestamps(momentObj) {
+      return {
+        iso: momentObj.format("YYYY-MM-DDTHH:mm:ssZ"),
+        display12: momentObj.format("hh:mm:ss A"), // 12-hour with AM/PM
+      };
     }
 
-    const { userId } = body || {};
-    if (!userId || typeof userId !== 'string') {
-      return res.status(400).json({ message: 'Missing or invalid userId' });
-    }
+    // If no record -> create new record (Punch In)
+    if (!record) {
+      const now = moment().tz(APP_TZ);
+      const { iso: isoNow, display12: shortNow12 } = makeTimestamps(now);
 
-    // verify user exists
-    const user = await User.findOne({ userId: String(userId) }).lean();
-    if (!user) {
-      return res.status(404).json({ message: 'User not found' });
-    }
+      const newRec = new Attendance({
+        userId: uidStr,
+        name: resolvedName,
+        role: resolvedRole,
+        date: today,
+        punchInAt: isoNow,
+        punchIn: shortNow12,
+        imageData: imageData ?? undefined,
+      });
 
-    // IST-aware now and today's date
-    const nowIst = dayjs().tz(APP_TZ);
-    const today = nowIst.format('YYYY-MM-DD');         // date in IST
-    const nowTime = nowIst.format('HH:mm:ss');         // human-friendly IST time
-    const recordedAtIso = isoWithOffset(nowIst);       // ISO with offset e.g. 2025-09-09T15:00:00+05:30
-    const recordedAtDate = nowIst.toDate();            // JS Date (instant)
+      await newRec.save();
 
-    // --- Atomic upsert for punchIn: use $setOnInsert and rawResult to detect insertion ---
-    const filter = { userId: String(userId), date: today };
-    const setOnInsert = {
-      userId: String(userId),
-      name: user.name || '',
-      role: user.role || '',
-      date: today,
-      punchIn: nowTime,
-      punchInIso: recordedAtIso,
-      recordedAt: recordedAtDate,
-      recordedAtIso: recordedAtIso,
-    };
-
-    const upsertRaw = await Attendance.findOneAndUpdate(
-      filter,
-      { $setOnInsert: setOnInsert },
-      { upsert: true, new: true, setDefaultsOnInsert: true, rawResult: true }
-    );
-
-    const docAfterUpsert = upsertRaw.value;
-    const didInsert = !!(upsertRaw.lastErrorObject && upsertRaw.lastErrorObject.upserted);
-
-    if (didInsert) {
-      // We just created the record -> this is a punch-in. Return immediately.
       return res.status(200).json({
-        message: 'Punched In Successfully',
-        status: 'Punched In',
-        punchIn: docAfterUpsert.punchIn,
-        punchInIso: docAfterUpsert.punchInIso,
-        recordedAtIso: docAfterUpsert.recordedAtIso,
+        message: "Punched In Successfully",
+        status: "Punched In",
+        date: today,
+        punchIn: newRec.punchIn,
+        punchInAt: newRec.punchInAt,
+        punchOut: null,
+        punchOutAt: null,
+        duration: null,
+        name: newRec.name,
+        role: newRec.role,
       });
     }
 
-    // If we reach here, a record already existed. Fetch it reliably.
-    const record = await Attendance.findOne(filter).lean();
-    if (!record) {
-      // Defensive: shouldn't happen
-      return res.status(500).json({ message: 'Attendance record missing after upsert' });
+    // If record exists but punchInAt missing -> repair it as a Punch In
+    if ((!record.punchInAt || record.punchInAt === null || String(record.punchInAt).trim() === "") && !record.punchOut) {
+      const now = moment().tz(APP_TZ);
+      const { iso: isoNow, display12: shortNow12 } = makeTimestamps(now);
+
+      record.punchInAt = isoNow;
+      record.punchIn = shortNow12;
+      if (resolvedName) record.name = resolvedName;
+      if (resolvedRole) record.role = resolvedRole;
+      if (imageData) record.imageData = imageData;
+      await record.save();
+
+      return res.status(200).json({
+        message: "Punched In (repaired missing punchInAt)",
+        status: "Punched In",
+        date: record.date,
+        punchIn: record.punchIn,
+        punchInAt: record.punchInAt,
+        punchOut: null,
+        punchOutAt: null,
+        duration: null,
+        name: record.name,
+        role: record.role,
+      });
     }
 
-    // CASE: has punchIn but no punchOut -> attempt punchOut
+    // If already punched in but not punched out -> try to punch out (with duplicate protection)
     if (record.punchIn && !record.punchOut) {
-      // Parse punchIn as IST for that date
-      // Accept punchIn as HH:mm:ss (the format we store)
-      const punchInMoment = dayjs.tz(`${record.date} ${record.punchIn}`, 'YYYY-MM-DD HH:mm:ss', APP_TZ);
-      if (!punchInMoment.isValid()) {
-        // fallback: try without seconds
-        const fallback = dayjs.tz(`${record.date} ${record.punchIn}`, 'YYYY-MM-DD HH:mm', APP_TZ);
-        if (fallback.isValid()) {
-          // assign fallback
+      // re-read to reduce staleness
+      record = await Attendance.findOne({ userId: uidStr, date: today });
+
+      // if punchInAt missing AFTER re-read, repair it as punch-in (safe fallback)
+      if (!record || !record.punchInAt) {
+        if (!record) {
+          // fallback create (shouldn't happen normally)
+          const now = moment().tz(APP_TZ);
+          const { iso: isoNow, display12: shortNow12 } = makeTimestamps(now);
+
+          const newRec = new Attendance({
+            userId: uidStr,
+            name: resolvedName,
+            role: resolvedRole,
+            date: today,
+            punchInAt: isoNow,
+            punchIn: shortNow12,
+            imageData: imageData ?? undefined,
+          });
+          await newRec.save();
+          return res.status(200).json({
+            message: "Punched In (created fallback record)",
+            status: "Punched In",
+            date: newRec.date,
+            punchIn: newRec.punchIn,
+            punchInAt: newRec.punchInAt,
+            punchOut: null,
+            punchOutAt: null,
+            duration: null,
+            name: newRec.name,
+            role: newRec.role,
+          });
+        } else {
+          // repair existing
+          const now = moment().tz(APP_TZ);
+          const { iso: isoNow, display12: shortNow12 } = makeTimestamps(now);
+
+          record.punchInAt = isoNow;
+          record.punchIn = shortNow12;
+          if (resolvedName) record.name = resolvedName;
+          if (resolvedRole) record.role = resolvedRole;
+          if (imageData) record.imageData = imageData;
+          await record.save();
+          return res.status(200).json({
+            message: "Punched In (repaired missing punchInAt)",
+            status: "Punched In",
+            date: record.date,
+            punchIn: record.punchIn,
+            punchInAt: record.punchInAt,
+            punchOut: null,
+            punchOutAt: null,
+            duration: null,
+            name: record.name,
+            role: record.role,
+          });
         }
       }
 
-      const diffSec = nowIst.diff(punchInMoment, 'second');
+      // compute elapsed seconds using a fresh "now"
+      const nowForElapsed = moment().tz(APP_TZ);
+      let elapsedSec = null;
+      try {
+        const inMoment = moment.tz(record.punchInAt, APP_TZ);
+        const nowMoment = nowForElapsed;
+        const elapsedMs = Math.max(0, nowMoment.valueOf() - inMoment.valueOf());
+        elapsedSec = Math.floor(elapsedMs / 1000);
+      } catch (e) {
+        console.warn("[submit-attendance] elapsed calc failed:", e);
+        return res.status(400).json({ message: "Could not compute elapsed time from punchInAt. Contact admin." });
+      }
 
-      if (diffSec < MIN_INTERVAL) {
-        // Too soon to punch out
-        return res.status(200).json({
-          message: `Duplicate/too-fast: already punched in ${diffSec}s ago. Minimum interval ${MIN_INTERVAL}s.`,
-          status: 'Already Punched In (recent)',
+      if (elapsedSec < Number(MIN_REPEAT_SECONDS)) {
+        // Too soon -> reject and don't punch out
+        return res.status(429).json({
+          message: `Too soon to punch out: already punched in ${elapsedSec} seconds ago. Please wait ${Number(MIN_REPEAT_SECONDS) - elapsedSec} more second(s).`,
+          status: "Punched In",
+          date: record.date,
           punchIn: record.punchIn,
-          secondsSincePunchIn: diffSec,
+          punchInAt: record.punchInAt,
+          punchOut: null,
+          punchOutAt: null,
+          duration: null,
+          name: record.name,
+          role: record.role,
         });
       }
 
-      // Atomic update to set punchOut only if still null/absent
+      // recompute timestamp now (important — do not reuse old isoNow)
+      const nowForPunchOut = moment().tz(APP_TZ);
+      const { iso: isoNowPunchOut, display12: shortNowPunchOut12 } = makeTimestamps(nowForPunchOut);
+
+      // atomic update for punchOut (only if still not set)
+      const updateFields = {
+        punchOutAt: isoNowPunchOut,
+        punchOut: shortNowPunchOut12,
+      };
+      if (resolvedName) updateFields.name = resolvedName;
+      if (resolvedRole) updateFields.role = resolvedRole;
+      if (imageData) updateFields.imageData = imageData;
+
       const updated = await Attendance.findOneAndUpdate(
-        { _id: record._id, $or: [{ punchOut: { $exists: false } }, { punchOut: null }] },
         {
-          $set: {
-            punchOut: nowTime,
-            punchOutIso: recordedAtIso,
-            recordedAt: recordedAtDate,
-            recordedAtIso: recordedAtIso,
-          },
+          userId: uidStr,
+          date: today,
+          punchOut: { $in: [null, undefined] },
+          punchInAt: record.punchInAt,
         },
+        { $set: updateFields },
         { new: true }
-      ).lean();
+      );
 
-      if (updated && updated.punchOut) {
-        return res.status(200).json({
-          message: 'Punched Out Successfully',
-          status: 'Punched Out',
-          punchIn: updated.punchIn,
-          punchInIso: updated.punchInIso,
-          punchOut: updated.punchOut,
-          punchOutIso: updated.punchOutIso,
-          recordedAtIso: updated.recordedAtIso,
-        });
-      }
+      if (!updated) {
+        // race lost — return latest
+        const latest = await Attendance.findOne({ userId: uidStr, date: today });
+        let computedDuration = null;
+        try {
+          if (latest?.punchInAt && latest?.punchOutAt) {
+            const inMoment = moment.tz(latest.punchInAt, APP_TZ);
+            const outMoment = moment.tz(latest.punchOutAt, APP_TZ);
+            const diffSec = Math.max(0, Math.floor((outMoment.valueOf() - inMoment.valueOf()) / 1000));
+            const hh = String(Math.floor(diffSec / 3600)).padStart(2, "0");
+            const mm = String(Math.floor((diffSec % 3600) / 60)).padStart(2, "0");
+            const ss = String(diffSec % 60).padStart(2, "0");
+            computedDuration = `${hh}:${mm}:${ss}`;
+          }
+        } catch (e) {
+          computedDuration = null;
+        }
 
-      // If concurrent request set punchOut, re-fetch and return
-      const latest = await Attendance.findById(record._id).lean();
-      if (latest && latest.punchOut) {
         return res.status(200).json({
-          message: 'Punched Out (by another request)',
-          status: 'Punched Out',
+          message: "Already Punched Out (race resolved)",
+          status: "Punched Out",
+          date: latest.date,
           punchIn: latest.punchIn,
-          punchInIso: latest.punchInIso,
+          punchInAt: latest.punchInAt ?? null,
           punchOut: latest.punchOut,
-          punchOutIso: latest.punchOutIso,
-          recordedAtIso: latest.recordedAtIso,
+          punchOutAt: latest.punchOutAt ?? null,
+          duration: computedDuration,
+          name: latest.name,
+          role: latest.role,
         });
       }
 
-      return res.status(500).json({ message: 'Could not set punchOut - try again' });
-    }
+      // success: compute duration using updated timestamps
+      let duration = null;
+      try {
+        const inMoment = moment.tz(updated.punchInAt, APP_TZ);
+        const outMoment = moment.tz(updated.punchOutAt, APP_TZ);
+        const diffSec = Math.max(0, Math.floor((outMoment.valueOf() - inMoment.valueOf()) / 1000));
+        const hh = String(Math.floor(diffSec / 3600)).padStart(2, "0");
+        const mm = String(Math.floor((diffSec % 3600) / 60)).padStart(2, "0");
+        const ss = String(diffSec % 60).padStart(2, "0");
+        duration = `${hh}:${mm}:${ss}`;
+      } catch (e) {
+        duration = null;
+      }
 
-    // Already punched out or other states
-    if (record.punchIn && record.punchOut) {
       return res.status(200).json({
-        message: 'Already Punched Out',
-        status: 'Punched Out',
-        punchIn: record.punchIn,
-        punchInIso: record.punchInIso,
-        punchOut: record.punchOut,
-        punchOutIso: record.punchOutIso,
-        recordedAtIso: record.recordedAtIso,
+        message: "Punched Out Successfully",
+        status: "Punched Out",
+        date: updated.date,
+        punchIn: updated.punchIn,
+        punchInAt: updated.punchInAt,
+        punchOut: updated.punchOut,
+        punchOutAt: updated.punchOutAt,
+        duration,
+        name: updated.name,
+        role: updated.role,
       });
     }
 
-    // Fallback
-    return res.status(400).json({ message: 'Invalid attendance state' });
+    // Already has both
+    let computedDuration = null;
+    try {
+      if (record.punchInAt && record.punchOutAt) {
+        const inMoment = moment.tz(record.punchInAt, APP_TZ);
+        const outMoment = moment.tz(record.punchOutAt, APP_TZ);
+        const diffSec = Math.max(0, Math.floor((outMoment.valueOf() - inMoment.valueOf()) / 1000));
+        const hh = String(Math.floor(diffSec / 3600)).padStart(2, "0");
+        const mm = String(Math.floor((diffSec % 3600) / 60)).padStart(2, "0");
+        const ss = String(diffSec % 60).padStart(2, "0");
+        computedDuration = `${hh}:${mm}:${ss}`;
+      }
+    } catch (e) {
+      computedDuration = null;
+    }
+
+    return res.status(200).json({
+      message: "Already Punched Out",
+      status: "Punched Out",
+      date: record.date,
+      punchIn: record.punchIn,
+      punchInAt: record.punchInAt ?? null,
+      punchOut: record.punchOut,
+      punchOutAt: record.punchOutAt ?? null,
+      duration: computedDuration,
+      name: record.name,
+      role: record.role,
+    });
   } catch (err) {
-    console.error('[Submit Attendance API Error]', err);
-    return res.status(500).json({ message: 'Internal Server Error', error: err.message });
+    console.error("[Submit Attendance API Error]", err);
+    return res.status(500).json({
+      message: "Internal Server Error",
+      error: err?.message ?? String(err),
+    });
   }
 }

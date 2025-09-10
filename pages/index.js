@@ -1,4 +1,4 @@
-"use client";
+// "use client";
 
 import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
@@ -100,7 +100,7 @@ export default function Home() {
     return canvas.toDataURL("image/jpeg", 0.9);
   };
 
-  // Main attendance handler — send image to server which will call Rekognition
+  // Main attendance handler — send image to server which will verify (Rekognition / matching)
   const handleAttendance = async () => {
     // prevent overlapping runs
     if (runningDetection.current) {
@@ -116,7 +116,7 @@ export default function Home() {
         return;
       }
 
-      console.log("▶️ Capturing image for Rekognition...");
+      console.log("▶️ Capturing image for verification...");
 
       const imageData = captureImage();
 
@@ -147,15 +147,21 @@ export default function Home() {
         const { name, role, userId, imageUrl } = result.user;
         console.log("🎯 Match confirmed:", { name, role, userId });
 
-        localStorage.setItem("uid", userId);
+        // Save uid locally
+        try {
+          localStorage.setItem("uid", userId);
+        } catch (e) {
+          /* ignore localStorage errors */
+        }
 
-        // Optional: notify Telegram (ignore errors)
+        // Optional: notify Telegram (fire-and-forget)
         fetch("/api/send-telegram", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ name, role, userId, imageData }),
         }).catch(() => {});
 
+        // Redirect to Success page (this page now only shows preview/details; it will not auto-submit attendance)
         const url = `/success?name=${encodeURIComponent(
           name
         )}&role=${encodeURIComponent(role)}&userId=${encodeURIComponent(
@@ -184,7 +190,6 @@ export default function Home() {
   };
 
   // Optional: auto-run attendance every N ms — disabled by default to avoid frequent server calls.
-  // If you want auto-detect, set enableAutoDetect = true and tune the interval.
   useEffect(() => {
     const enableAutoDetect = false; // set to true if you want periodic auto-checks
     const intervalMs = 2500;

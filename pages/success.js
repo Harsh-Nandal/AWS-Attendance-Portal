@@ -1,7 +1,6 @@
-// pages/success.js
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
 
@@ -11,55 +10,98 @@ export default function SuccessPage() {
   const [role, setRole] = useState("");
   const [imageData, setImageData] = useState("");
   const [loading, setLoading] = useState(true);
-  const [processing, setProcessing] = useState(false);
-
-  // attendance result fields
-  const [attendanceStatus, setAttendanceStatus] = useState("");
-  const [punchIn, setPunchIn] = useState(null);
-  const [punchOut, setPunchOut] = useState(null);
-  const [attendanceMessage, setAttendanceMessage] = useState("");
-  const [heading, setHeading] = useState("Attendance"); // dynamic heading
+  const [submitting, setSubmitting] = useState(false);
+  const [attendanceResult, setAttendanceResult] = useState(null);
+  const [error, setError] = useState("");
 
   const router = useRouter();
+  const alreadySubmittedRef = useRef(false);
 
-  useEffect(() => {
-    const params = new URLSearchParams(window.location.search);
-    const uid = params.get("userId");
-    const uname = params.get("name");
-    const urole = params.get("role");
-    const img = params.get("imageData") || params.get("imageUrl");
-    // decide mode: "register" or "detection"
-    const from = (params.get("from") || "").toLowerCase(); // expecting "register" or "detection"
-    const mode = from === "register" ? "register" : "detection";
+  const safeParseJson = async (resp) => {
+    try {
+      return await resp.json();
+    } catch {
+      return null;
+    }
+  };
 
-    if (!uid || !uname || !urole || !img) {
-      alert("⚠️ Missing data. Please register / detect again.");
-      router.push("/newStudent");
+  const submitAttendance = async ({ userId, name, role, imageData }) => {
+    if (submitting || alreadySubmittedRef.current) return;
+
+    if (!userId || !name || !role || !imageData) {
+      setError("Missing data. Please register again.");
       return;
     }
 
-    setUserId(uid);
-    setName(uname);
-    setRole(urole);
-    setImageData(img);
-    setHeading(mode === "register" ? "Registration Complete" : "Attendance");
+    alreadySubmittedRef.current = true;
+    setSubmitting(true);
+    setError("");
+    setAttendanceResult(null);
 
-    // run appropriate flow automatically
-    (async function runFlow() {
-      setLoading(false);
-      // slight delay to allow UI paint
-      await new Promise((r) => setTimeout(r, 200));
-      if (mode === "register") {
-        await runRegisterThenPunch({ name: uname, userId: uid, role: urole, imageData: img });
+    try {
+      const resp = await fetch("/api/submit-attendance", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ userId, name, role, imageData }),
+      });
+
+      const data = await safeParseJson(resp);
+
+      if (!resp.ok) {
+        // handle 429/400/500 etc
+        const message = data?.message || `Server returned ${resp.status}`;
+        setError(message);
+        // if server returned a partial attendance object, show it
+        if (data && data.status) setAttendanceResult(data);
       } else {
-        // detection/attendance flow
-        await runPunchOnly({ userId: uid });
+        setAttendanceResult(data);
+      }
+    } catch (err) {
+      console.error("Submit attendance error:", err);
+      setError("Network error. Please try again.");
+    } finally {
+      setSubmitting(false);
+      setTimeout(() => {
+        alreadySubmittedRef.current = false;
+      }, 5000);
+    }
+  };
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const params = new URLSearchParams(window.location.search);
+        const uid = params.get("userId");
+        const uname = params.get("name");
+        const urole = params.get("role");
+        const img = params.get("imageData");
+
+        if (uid && uname && urole && img) {
+          setUserId(uid);
+          setName(uname);
+          setRole(urole);
+          setImageData(img);
+
+          await submitAttendance({ userId: uid, name: uname, role: urole, imageData: img });
+        } else {
+          alert("⚠️ Missing data. Please register again.");
+          router.push("/");
+        }
+      } finally {
+        setLoading(false);
       }
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [router]);
+  }, []);
 
-  // decode data URLs if encoded
+  if (loading) {
+    return (
+      <main className="flex items-center justify-center h-screen bg-gray-100">
+        <p className="text-lg font-medium text-gray-600">Loading...</p>
+      </main>
+    );
+  }
+
   let previewSrc = imageData;
   try {
     previewSrc = decodeURIComponent(imageData);
@@ -67,115 +109,14 @@ export default function SuccessPage() {
     previewSrc = imageData;
   }
 
-  async function runRegisterThenPunch({ name, userId, role, imageData }) {
-    setProcessing(true);
-    setAttendanceMessage("");
-    setAttendanceStatus("");
-    setPunchIn(null);
-    setPunchOut(null);
-
-    try {
-      // 1) Register user (server uploads to Cloudinary + tries to index Rekognition)
-      const regResp = await fetch("/api/register", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name, userId, role, imageData }),
-      });
-
-      const regJson = await regResp.json();
-
-      if (!regResp.ok) {
-        const msg = regJson?.message || regJson?.error || JSON.stringify(regJson);
-        alert("Registration failed: " + msg);
-        setProcessing(false);
-        return;
-      }
-
-      const createdUser = regJson.user ?? regJson;
-      if (!createdUser) {
-        alert("Server returned no user data after register.");
-        setProcessing(false);
-        return;
-      }
-
-      if (regJson.rekognitionError) {
-        // warn but continue
-        setAttendanceMessage("Warning: Rekognition indexing failed: " + regJson.rekognitionError);
-      }
-
-      // 2) Submit attendance (punch) with the registered userId
-      await runPunchOnly({ userId: String(createdUser.userId ?? userId) });
-    } catch (err) {
-      console.error("Network/server error:", err);
-      alert("Network/server error. Please try again.");
-    } finally {
-      setProcessing(false);
-    }
-  }
-
-  async function runPunchOnly({ userId }) {
-    setProcessing(true);
-    setAttendanceMessage("");
-    setAttendanceStatus("");
-    setPunchIn(null);
-    setPunchOut(null);
-
-    try {
-      const attResp = await fetch("/api/submit-attendance", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ userId: String(userId) }),
-      });
-
-      const attJson = await attResp.json();
-
-      if (!attResp.ok) {
-        const msg = attJson?.message || attJson?.error || JSON.stringify(attJson);
-        alert("Attendance failed: " + msg);
-        setProcessing(false);
-        return;
-      }
-
-      // expected: { ok:true, status:"Punched In"|"Punched Out"|"Already Punched Out", punchIn, punchOut, recordedAt }
-      const status = attJson.status || attJson.statusText || "Unknown";
-      setAttendanceStatus(status);
-      setPunchIn(attJson.punchIn || null);
-      setPunchOut(attJson.punchOut || null);
-      setAttendanceMessage(attJson.message || "");
-    } catch (err) {
-      console.error("Attendance error:", err);
-      alert("Attendance error. Try again.");
-    } finally {
-      setProcessing(false);
-    }
-  }
-
-  // show a simple loader block during processing
-  function renderProcessing() {
-    if (!processing) return null;
-    return (
-      <div className="my-4 text-sm text-gray-600 flex items-center justify-center gap-2">
-        <svg className="animate-spin h-5 w-5 text-gray-600" viewBox="0 0 24 24" fill="none">
-          <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" strokeOpacity="0.25" />
-          <path d="M22 12a10 10 0 00-10-10" stroke="currentColor" strokeWidth="4" strokeLinecap="round" />
-        </svg>
-        <span>Processing...</span>
-      </div>
-    );
-  }
-
-  const now = new Date();
-  const date = now.toLocaleDateString();
-  const time = now.toLocaleTimeString();
-
   return (
     <main className="min-h-screen w-full flex items-center justify-center bg-gradient-to-br from-blue-50 to-gray-100 px-4 py-6">
       <div className="bg-white shadow-xl rounded-2xl max-w-md w-full p-6 text-center border border-gray-200">
-        <h1 className="text-2xl font-bold text-gray-800 mb-4 flex items-center justify-center gap-2">
-          {heading}
+        <h1 className="text-2xl font-bold text-gray-800 mb-6 flex items-center justify-center gap-2">
+          🎉 Attendance Details
         </h1>
 
-        {previewSrc && (
+        {imageData && (
           <div className="flex justify-center mb-4">
             <img
               src={previewSrc}
@@ -185,49 +126,30 @@ export default function SuccessPage() {
           </div>
         )}
 
-        <div className="space-y-2 text-gray-700 text-left mb-4">
-          <p>
-            <span className="font-semibold">Name:</span> {name}
-          </p>
-          <p>
-            <span className="font-semibold">ID:</span> {userId}
-          </p>
-          <p>
-            <span className="font-semibold">Role:</span> {role}
-          </p>
-          <p>
-            <span className="font-semibold">Date:</span> {date}
-          </p>
-          <p>
-            <span className="font-semibold">Time:</span> {time}
-          </p>
+        <div className="space-y-2 text-gray-700 text-left mb-6">
+          <p><span className="font-semibold">Name:</span> {name}</p>
+          <p><span className="font-semibold">ID:</span> {userId}</p>
+          <p><span className="font-semibold">Role:</span> {role}</p>
         </div>
 
-        {attendanceMessage && (
-          <div className="mb-4 text-sm text-yellow-700 bg-yellow-50 p-2 rounded">{attendanceMessage}</div>
+        {attendanceResult ? (
+          <div className="text-left bg-gray-50 p-4 rounded-md mb-4 border">
+            <p className="font-semibold text-sm mb-2">Status: {attendanceResult.status}</p>
+            <p className="text-sm"><span className="font-medium">Date:</span> {attendanceResult.date ?? "—"}</p>
+            <p className="text-sm"><span className="font-medium">Punch In:</span> {attendanceResult.punchIn ?? "—"}</p>
+            <p className="text-sm"><span className="font-medium">Punch Out:</span> {attendanceResult.punchOut ?? "—"}</p>
+            {attendanceResult.duration && <p className="text-sm"><span className="font-medium">Duration:</span> {attendanceResult.duration}</p>}
+            {attendanceResult.message && <p className="text-xs text-gray-600 mt-2">{attendanceResult.message}</p>}
+          </div>
+        ) : (
+          <div className="text-left bg-transparent p-1 mb-4">
+            <p className="text-sm text-gray-500">{submitting ? "⏳ Punching attendance..." : "Recording attendance..."}</p>
+          </div>
         )}
 
-        {renderProcessing()}
+        {error && <p className="text-sm text-red-600 mb-3">{error}</p>}
 
-        {attendanceStatus ? (
-          <div className="mb-4">
-            <div className="text-sm font-medium text-gray-700 mb-2">Attendance status:</div>
-            <div className="inline-flex items-center gap-3 px-4 py-2 rounded-full bg-gray-100 text-gray-800">
-              <span className="font-semibold">{attendanceStatus}</span>
-              {punchIn && <span className="text-xs opacity-80">In: {punchIn}</span>}
-              {punchOut && <span className="text-xs opacity-80">Out: {punchOut}</span>}
-            </div>
-          </div>
-        ) : null}
-
-        <div className="mt-3">
-          <Link
-            href="/"
-            className="inline-block w-full py-3 rounded-lg text-white font-medium bg-blue-500 hover:bg-blue-600 transition shadow-md"
-          >
-            🏠 Back to Home
-          </Link>
-        </div>
+        <Link href="/" className="mt-4 inline-block text-blue-500 hover:underline text-sm font-medium">🏠 Back to Home</Link>
       </div>
     </main>
   );
