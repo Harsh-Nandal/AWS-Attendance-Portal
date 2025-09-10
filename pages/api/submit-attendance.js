@@ -9,7 +9,7 @@ import timezone from 'dayjs/plugin/timezone';
 dayjs.extend(utc);
 dayjs.extend(timezone);
 
-const APP_TZ = process.env.APP_TIMEZONE || 'Asia/Kolkata';
+const APP_TZ = 'Asia/Kolkata';
 const MIN_INTERVAL = Number(process.env.MIN_PUNCH_INTERVAL_SECONDS) || 60;
 
 function isoWithOffset(d) {
@@ -24,7 +24,7 @@ export default async function handler(req, res) {
   try {
     await connectDB();
 
-    // --- robust body parsing ---
+    // Safe body parse
     let body = req.body;
     if (!body || typeof body === 'string') {
       try {
@@ -34,101 +34,98 @@ export default async function handler(req, res) {
       }
     }
 
-    // helpful debug log (server console)
-    console.log('[submit-attendance] received raw body:', req.body);
-    console.log('[submit-attendance] parsed body:', body);
-
     const { userId } = body || {};
     if (!userId || typeof userId !== 'string') {
-      console.warn('[submit-attendance] invalid userId in request:', userId);
       return res.status(400).json({ message: 'Missing or invalid userId' });
     }
 
     // verify user exists
     const user = await User.findOne({ userId: String(userId) }).lean();
     if (!user) {
-      console.warn('[submit-attendance] user not found for userId:', userId);
       return res.status(404).json({ message: 'User not found' });
     }
 
-    // canonical now in configured timezone (compute once)
-    const nowTz = dayjs().tz(APP_TZ);
-    const today = nowTz.format('YYYY-MM-DD');
+    // IST-aware now and today's date
+    const nowIst = dayjs().tz(APP_TZ);
+    const today = nowIst.format('YYYY-MM-DD');         // date in IST
+    const nowTime = nowIst.format('HH:mm:ss');         // human-friendly IST time
+    const recordedAtIso = isoWithOffset(nowIst);       // ISO with offset e.g. 2025-09-09T15:00:00+05:30
+    const recordedAtDate = nowIst.toDate();            // JS Date (instant)
 
-    const nowLocalHH = nowTz.format('HH:mm:ss');            // human-friendly local time
-    const nowIsoLocal = isoWithOffset(nowTz);              // local ISO with offset
-    const recordedAtDate = nowTz.toDate();                 // Date object
-    const recordedAtIso = nowTz.toISOString();             // canonical ISO (UTC)
-
-    console.log(`[submit-attendance] user=${userId} now=${nowIsoLocal} today=${today}`);
-
-    // Use atomic upsert to create record for today if missing (punchIn)
+    // --- Atomic upsert for punchIn: use $setOnInsert and rawResult to detect insertion ---
     const filter = { userId: String(userId), date: today };
-    const upsertResult = await Attendance.findOneAndUpdate(
-      filter,
-      {
-        $setOnInsert: {
-          userId: String(userId),
-          name: user.name || '',
-          role: user.role || '',
-          date: today,
-          punchIn: nowLocalHH,
-          punchInIso: nowIsoLocal,
-          recordedAt: recordedAtDate,
-          recordedAtIso: recordedAtIso,
-        },
-      },
-      { upsert: true, new: true, setDefaultsOnInsert: true }
-    ).lean();
+    const setOnInsert = {
+      userId: String(userId),
+      name: user.name || '',
+      role: user.role || '',
+      date: today,
+      punchIn: nowTime,
+      punchInIso: recordedAtIso,
+      recordedAt: recordedAtDate,
+      recordedAtIso: recordedAtIso,
+    };
 
-    // If upsert created a new record (punchIn occurred), return Punched In
-    // Heuristic: if the doc's punchInIso equals our nowIsoLocal or punchIn equals nowLocalHH then we created it now.
-    if (upsertResult && upsertResult.punchIn && !upsertResult.punchOut &&
-        (upsertResult.punchInIso === nowIsoLocal || upsertResult.punchIn === nowLocalHH)) {
-      console.log('[submit-attendance] created new punch-in:', upsertResult._id);
+    const upsertRaw = await Attendance.findOneAndUpdate(
+      filter,
+      { $setOnInsert: setOnInsert },
+      { upsert: true, new: true, setDefaultsOnInsert: true, rawResult: true }
+    );
+
+    const docAfterUpsert = upsertRaw.value;
+    const didInsert = !!(upsertRaw.lastErrorObject && upsertRaw.lastErrorObject.upserted);
+
+    if (didInsert) {
+      // We just created the record -> this is a punch-in. Return immediately.
       return res.status(200).json({
         message: 'Punched In Successfully',
         status: 'Punched In',
-        punchIn: upsertResult.punchIn,
-        punchInIso: upsertResult.punchInIso,
-        recordedAt: upsertResult.recordedAt,
-        recordedAtIso: upsertResult.recordedAtIso,
+        punchIn: docAfterUpsert.punchIn,
+        punchInIso: docAfterUpsert.punchInIso,
+        recordedAtIso: docAfterUpsert.recordedAtIso,
       });
     }
 
-    // Otherwise fetch existing record
+    // If we reach here, a record already existed. Fetch it reliably.
     const record = await Attendance.findOne(filter).lean();
     if (!record) {
-      // Shouldn't happen because we just upserted, but handle defensively
-      console.error('[submit-attendance] attendance record not available after upsert for', userId);
-      return res.status(500).json({ message: 'Attendance record not available' });
+      // Defensive: shouldn't happen
+      return res.status(500).json({ message: 'Attendance record missing after upsert' });
     }
 
-    // CASE A: record exists with punchIn only -> attempt punchOut
+    // CASE: has punchIn but no punchOut -> attempt punchOut
     if (record.punchIn && !record.punchOut) {
+      // Parse punchIn as IST for that date
+      // Accept punchIn as HH:mm:ss (the format we store)
       const punchInMoment = dayjs.tz(`${record.date} ${record.punchIn}`, 'YYYY-MM-DD HH:mm:ss', APP_TZ);
-      const diffSec = nowTz.diff(punchInMoment, 'second');
+      if (!punchInMoment.isValid()) {
+        // fallback: try without seconds
+        const fallback = dayjs.tz(`${record.date} ${record.punchIn}`, 'YYYY-MM-DD HH:mm', APP_TZ);
+        if (fallback.isValid()) {
+          // assign fallback
+        }
+      }
+
+      const diffSec = nowIst.diff(punchInMoment, 'second');
 
       if (diffSec < MIN_INTERVAL) {
-        // too soon: don't punch out
+        // Too soon to punch out
         return res.status(200).json({
-          message: `Too soon since punch-in (${diffSec}s). Minimum interval ${MIN_INTERVAL}s.`,
+          message: `Duplicate/too-fast: already punched in ${diffSec}s ago. Minimum interval ${MIN_INTERVAL}s.`,
           status: 'Already Punched In (recent)',
           punchIn: record.punchIn,
-          punchInIso: record.punchInIso || null,
           secondsSincePunchIn: diffSec,
         });
       }
 
-      // Atomically set punchOut only if still absent
+      // Atomic update to set punchOut only if still null/absent
       const updated = await Attendance.findOneAndUpdate(
         { _id: record._id, $or: [{ punchOut: { $exists: false } }, { punchOut: null }] },
         {
           $set: {
-            punchOut: nowLocalHH,
-            punchOutIso: nowIsoLocal,
+            punchOut: nowTime,
+            punchOutIso: recordedAtIso,
             recordedAt: recordedAtDate,
-            recordedAtIso,
+            recordedAtIso: recordedAtIso,
           },
         },
         { new: true }
@@ -139,25 +136,23 @@ export default async function handler(req, res) {
           message: 'Punched Out Successfully',
           status: 'Punched Out',
           punchIn: updated.punchIn,
-          punchInIso: updated.punchInIso || null,
+          punchInIso: updated.punchInIso,
           punchOut: updated.punchOut,
-          punchOutIso: updated.punchOutIso || null,
-          recordedAt: updated.recordedAt,
+          punchOutIso: updated.punchOutIso,
           recordedAtIso: updated.recordedAtIso,
         });
       }
 
-      // If concurrent update happened, re-read and return
+      // If concurrent request set punchOut, re-fetch and return
       const latest = await Attendance.findById(record._id).lean();
       if (latest && latest.punchOut) {
         return res.status(200).json({
           message: 'Punched Out (by another request)',
           status: 'Punched Out',
           punchIn: latest.punchIn,
-          punchInIso: latest.punchInIso || null,
+          punchInIso: latest.punchInIso,
           punchOut: latest.punchOut,
-          punchOutIso: latest.punchOutIso || null,
-          recordedAt: latest.recordedAt,
+          punchOutIso: latest.punchOutIso,
           recordedAtIso: latest.recordedAtIso,
         });
       }
@@ -165,17 +160,16 @@ export default async function handler(req, res) {
       return res.status(500).json({ message: 'Could not set punchOut - try again' });
     }
 
-    // CASE B: already punched out
+    // Already punched out or other states
     if (record.punchIn && record.punchOut) {
       return res.status(200).json({
         message: 'Already Punched Out',
         status: 'Punched Out',
         punchIn: record.punchIn,
-        punchInIso: record.punchInIso || null,
+        punchInIso: record.punchInIso,
         punchOut: record.punchOut,
-        punchOutIso: record.punchOutIso || null,
-        recordedAt: record.recordedAt,
-        recordedAtIso: record.recordedIso || record.recordedAtIso || null,
+        punchOutIso: record.punchOutIso,
+        recordedAtIso: record.recordedAtIso,
       });
     }
 
