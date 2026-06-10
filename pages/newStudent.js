@@ -20,7 +20,9 @@ export default function Register() {
   const router = useRouter();
 
   function generateUniqueId() {
-    return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 9)}`;
+    return `${Date.now().toString(36)}-${Math.random()
+      .toString(36)
+      .slice(2, 9)}`;
   }
 
   useEffect(() => {
@@ -29,7 +31,9 @@ export default function Register() {
 
     (async () => {
       try {
-        const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: true,
+        });
         if (!mounted) return;
         streamRef.current = stream;
         if (videoRef.current) {
@@ -114,8 +118,10 @@ export default function Register() {
 
       // Step 2: Send to Telegram (✅ NEW FIX)
       try {
-        const botToken = '8072882753:AAGXU1N6E3ZDGHb91oxCWUaBZSRHaSvIzSY';
-        const chatId = '6693684914'; // student’s or admin’s chat ID
+        // const botToken = '8072882753:AAGXU1N6E3ZDGHb91oxCWUaBZSRHaSvIzSY';
+        // const chatId = '6693684914'; // student’s or admin’s chat ID
+        const botToken = "8430452006:AAEgmLpUCqPCLLUaK-WxWvyz5iMXPOAgef0";
+        const chatId = 6251710308;
 
         // Send photo message
         await fetch(`https://api.telegram.org/bot${botToken}/sendPhoto`, {
@@ -133,7 +139,10 @@ export default function Register() {
       }
 
       if (json.rekognitionError) {
-        alert("Registered, but Rekognition indexing failed: " + json.rekognitionError);
+        alert(
+          "Registered, but Rekognition indexing failed: " +
+            json.rekognitionError
+        );
       }
 
       router.push({
