@@ -5,7 +5,7 @@ import connectDB from '../../lib/mongodb';
 import Attendance from '../../models/Attendance';
 import Students from '../../models/User'; // Assuming you have a Students model
 
-const BOT_TOKEN = '8072882753:AAGXU1N6E3ZDGHb91oxCWUaBZSRHaSvIzSY'; // Move to .env for security
+const BOT_TOKEN = '8715942964:AAGwSzHCLGmijm6GpGgXqcHOQkJsaKTENPI'; // Move to .env for security
 const CHAT_ID = '6693684914'; // Your Telegram ID or group/channel ID
 
 
